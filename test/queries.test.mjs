@@ -27,7 +27,9 @@ test("concurrent reads share one request and return independent values", async (
   const first = queries.get(ACCOUNT, MODEL_PATH);
   const second = queries.get(ACCOUNT, MODEL_PATH);
   assert.equal(calls, 1);
-  finish(Response.json({ data: [{ id: "model" }] }));
+  finish(
+    Response.json({ data: [{ id: "model", protocols: ["openai_responses"] }] }),
+  );
   const [left, right] = await Promise.all([first, second]);
   left.data[0].id = "changed";
   assert.equal(right.data[0].id, "model");
@@ -41,7 +43,12 @@ test("cache identity includes site path, complete Key, and endpoint", async (t) 
   let calls = 0;
   t.mock.method(globalThis, "fetch", async (url, options) => {
     calls++;
-    return Response.json({ url, credential: options.headers.Authorization });
+    return Response.json({
+      data: [],
+      mode: "unrestricted",
+      url,
+      credential: options.headers.Authorization,
+    });
   });
   const queries = createQueries();
   const requests = [
@@ -66,7 +73,7 @@ test("successful metadata has separate short lifetimes", async (t) => {
   let calls = 0;
   t.mock.method(Date, "now", () => now);
   t.mock.method(globalThis, "fetch", async () =>
-    Response.json({ sequence: ++calls }),
+    Response.json({ data: [], mode: "unrestricted", sequence: ++calls }),
   );
   const queries = createQueries();
   await queries.get(ACCOUNT, MODEL_PATH);
@@ -115,13 +122,13 @@ test("invalidated in-flight requests do not repopulate the cache", async (t) => 
       return new Promise((resolve) => {
         finish = resolve;
       });
-    return Promise.resolve(Response.json({ sequence: calls }));
+    return Promise.resolve(Response.json({ data: [], sequence: calls }));
   });
   const queries = createQueries();
   const first = queries.get(ACCOUNT, MODEL_PATH);
   queries.clear(ACCOUNT);
   const second = await queries.get(ACCOUNT, MODEL_PATH);
-  finish(Response.json({ sequence: 1 }));
+  finish(Response.json({ data: [], sequence: 1 }));
   assert.equal((await first).sequence, 1);
   assert.equal(second.sequence, 2);
   assert.equal((await queries.get(ACCOUNT, MODEL_PATH)).sequence, 2);
@@ -171,4 +178,74 @@ test("body deadline failures use the query timeout message", async (t) => {
     assert.ok(!error.message.includes("private-detail"));
     return true;
   });
+});
+
+// A successful HTTP response can contain a broken catalogue while the backend recovers immediately afterward.
+// Malformed entries reject the complete refresh and remain uncached, so the next valid list is available immediately.
+test("malformed model payloads do not become cached empty or partial catalogues", async (t) => {
+  const invalid = [
+    null,
+    {},
+    { data: [null] },
+    { data: [{ id: "bad" }] },
+    { data: [{ id: "bad", protocols: [null] }] },
+    { data: [{ id: "bad", protocols: [], native_protocols: [null] }] },
+    {
+      data: [
+        { id: "bad", protocols: [], attributes: { reasoning_options: [null] } },
+      ],
+    },
+    { data: [{ id: "bad", protocols: [], display_name: {} }] },
+    {
+      data: [
+        { id: "duplicate", protocols: [] },
+        { id: "duplicate", protocols: [] },
+      ],
+    },
+  ];
+  let calls = 0;
+  t.mock.method(globalThis, "fetch", async () => {
+    const body =
+      calls % 2 === 0
+        ? invalid[Math.floor(calls / 2)]
+        : { data: [{ id: "recovered", protocols: ["openai_responses"] }] };
+    calls++;
+    return Response.json(body);
+  });
+  const queries = createQueries();
+  for (let index = 0; index < invalid.length; index++) {
+    queries.clear(ACCOUNT);
+    await assert.rejects(queries.get(ACCOUNT, MODEL_PATH), /格式无效|升级/);
+    assert.equal(
+      (await queries.get(ACCOUNT, MODEL_PATH)).data[0].id,
+      "recovered",
+    );
+  }
+  assert.equal(calls, invalid.length * 2);
+});
+
+// Usage metadata may be syntactically valid JSON while its mode or window rows are malformed.
+// Those replies cannot persist for the usage cache lifetime, and a repaired response succeeds on the next refresh.
+test("malformed usage metadata can recover on the next refresh", async (t) => {
+  const invalid = [
+    {},
+    { mode: "unrestricted", billing: [] },
+    { mode: "quota_limited", rate_limits: [null] },
+    { mode: "quota_limited", rate_limits: [{ window: {} }] },
+  ];
+  let calls = 0;
+  t.mock.method(globalThis, "fetch", async () => {
+    const body =
+      calls % 2 === 0
+        ? invalid[Math.floor(calls / 2)]
+        : { mode: "unrestricted", balance: 10 };
+    calls++;
+    return Response.json(body);
+  });
+  const queries = createQueries();
+  for (let index = 0; index < invalid.length; index++) {
+    queries.clear(ACCOUNT);
+    await assert.rejects(queries.get(ACCOUNT, "/v1/usage"), /格式无效/);
+    assert.equal((await queries.get(ACCOUNT, "/v1/usage")).balance, 10);
+  }
 });

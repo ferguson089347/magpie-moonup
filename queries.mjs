@@ -12,7 +12,9 @@ import { createHash } from "node:crypto";
 // and callers receive detached JSON values. Failed requests remove their
 // entries, while authentication rejection clears the account's observations.
 // A pending request cleared by another failure cannot repopulate its entry
-// after completion. Fixed entry and response-size limits bound retained state.
+// after completion. Model and usage shapes are checked before publication so
+// malformed successful HTTP replies cannot hide a recovery behind the cache.
+// Fixed entry and response-size limits bound retained state.
 
 // These limits bound query lifetime, JSON size, and cached account observations.
 // Model lists last thirty seconds; usage lasts five seconds for frequently refreshed cards.
@@ -50,8 +52,10 @@ export function createQueries() {
      * The path must be one of the two plugin metadata endpoints. A new request
      * replaces an expired entry, and the least recently inserted entry is
      * removed when the cache reaches its count limit. HTTP failures retain
-     * their sign-in classification and never become cached successes. Shared
-     * pending results stay detached from entries invalidated by credential rejection.
+     * their sign-in classification. HTTP and payload-validation failures stay
+     * uncached, including malformed entries inside an otherwise valid model
+     * list. Shared pending results stay detached from entries invalidated by
+     * credential rejection.
      */
     async get(account, path) {
       if (!["/v1/models?include=capabilities", "/v1/usage"].includes(path)) {
@@ -66,6 +70,7 @@ export function createQueries() {
       const entry = { scope, pending: true, expires: 0 };
       entry.promise = readJSON(account, path)
         .then((value) => {
+          validateMetadata(value, path);
           // Entries are stored before fetch settles. An invalidated request can
           // still answer existing callers, but its result never recreates the removed cache entry.
           entry.pending = false;
@@ -87,6 +92,95 @@ export function createQueries() {
       return structuredClone(await entry.promise);
     },
   };
+}
+
+/** validateMetadata rejects malformed model and usage observations before caching.
+ * An empty model array is valid, while a malformed entry rejects the whole
+ * response so a partial catalogue cannot replace the host's previous list.
+ * Missing model protocols retain the server-upgrade explanation. Usage mode,
+ * funding objects, and spending-window rows follow the public response shape;
+ * absent optional amounts remain unknown for the usage presentation layer.
+ */
+function validateMetadata(value, path) {
+  const object =
+    value !== null && typeof value === "object" && !Array.isArray(value);
+  if (path === "/v1/models?include=capabilities") {
+    if (!object || !Array.isArray(value.data)) {
+      throw new Error("moonup 返回的模型列表格式无效，请稍后刷新重试。");
+    }
+    const ids = new Set();
+    for (const model of value.data) {
+      if (
+        !model ||
+        typeof model !== "object" ||
+        Array.isArray(model) ||
+        typeof model.id !== "string" ||
+        !model.id.trim() ||
+        ids.has(model.id)
+      ) {
+        throw new Error("moonup 返回的模型条目格式无效，请稍后刷新重试。");
+      }
+      if (!Array.isArray(model.protocols)) {
+        throw new Error("请升级 moonup 服务端，以支持插件自动识别模型协议。");
+      }
+      if (
+        model.protocols.some(
+          (protocol) => typeof protocol !== "string" || !protocol,
+        )
+      ) {
+        throw new Error("moonup 返回的模型协议格式无效，请稍后刷新重试。");
+      }
+      if (
+        model.native_protocols != null &&
+        (!Array.isArray(model.native_protocols) ||
+          model.native_protocols.some(
+            (protocol) => typeof protocol !== "string" || !protocol,
+          ))
+      ) {
+        throw new Error("moonup 返回的模型协议格式无效，请稍后刷新重试。");
+      }
+      const attributes = model.attributes;
+      if (
+        (model.display_name != null &&
+          typeof model.display_name !== "string") ||
+        (attributes != null &&
+          (typeof attributes !== "object" || Array.isArray(attributes))) ||
+        (attributes?.reasoning_options != null &&
+          (!Array.isArray(attributes.reasoning_options) ||
+            attributes.reasoning_options.some(
+              (option) =>
+                !option || typeof option !== "object" || Array.isArray(option),
+            )))
+      ) {
+        throw new Error("moonup 返回的模型能力格式无效，请稍后刷新重试。");
+      }
+      ids.add(model.id);
+    }
+    return;
+  }
+  if (!object || !["unrestricted", "quota_limited"].includes(value.mode)) {
+    throw new Error("moonup 返回的额度信息格式无效，请稍后刷新重试。");
+  }
+  for (const name of ["billing", "subscription", "quota"]) {
+    const field = value[name];
+    if (field != null && (typeof field !== "object" || Array.isArray(field))) {
+      throw new Error("moonup 返回的额度信息格式无效，请稍后刷新重试。");
+    }
+  }
+  if (
+    value.rate_limits != null &&
+    (!Array.isArray(value.rate_limits) ||
+      value.rate_limits.some(
+        (row) =>
+          !row ||
+          typeof row !== "object" ||
+          Array.isArray(row) ||
+          typeof row.window !== "string" ||
+          !row.window,
+      ))
+  ) {
+    throw new Error("moonup 返回的额度窗口格式无效，请稍后刷新重试。");
+  }
 }
 
 /** scopeOf derives a cache identity from one deployment and complete credential.

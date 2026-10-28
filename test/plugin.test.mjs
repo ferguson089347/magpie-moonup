@@ -402,6 +402,46 @@ test("account labels distinguish matching Key suffixes", async () => {
   assert.equal(saved[0].path.id, "moonup");
 });
 
+// An accidentally pasted short credential can fit entirely inside the usual four-character account hint.
+// Its saved label uses the nonsecret site and digest, while the original credential remains in authentication storage.
+test("short invalid credentials are not displayed in account labels", async () => {
+  const saved = [];
+  const hooks = await MoonupPlugin({
+    client: { auth: { set: async (value) => saved.push(value) } },
+  });
+  await hooks.auth.loader(async () => ({
+    type: "api",
+    key: "abcd",
+    metadata: { baseURL: "https://moonup.dev" },
+  }));
+  assert.ok(!saved[0].body.accountId.includes("abcd"));
+  assert.equal(saved[0].body.key, "abcd");
+});
+
+// A refreshed model list with a malformed item must not replace previously usable entries with an empty result.
+// The public hook rejects that response and fetches the immediately repaired catalogue on its next call.
+test("invalid model responses fail refresh and allow immediate recovery", async (t) => {
+  let calls = 0;
+  t.mock.method(globalThis, "fetch", async () =>
+    Response.json(
+      ++calls === 1
+        ? { data: [null] }
+        : { data: [{ id: "recovered", protocols: ["openai_responses"] }] },
+    ),
+  );
+  const hooks = await MoonupPlugin();
+  const auth = {
+    type: "api",
+    key: "sk-fixture",
+    metadata: { baseURL: "https://moonup.dev" },
+  };
+  await assert.rejects(hooks.provider.models({}, { auth }), /条目格式无效/);
+  assert.deepEqual(Object.keys(await hooks.provider.models({}, { auth })), [
+    "recovered",
+  ]);
+  assert.equal(calls, 2);
+});
+
 // A zero wallet balance is a measured value rather than missing information.
 // Authentication failures request sign-in, while exhausted funds keep the existing credential.
 test("usage shows zero balance and separates funding from authentication failure", async (t) => {

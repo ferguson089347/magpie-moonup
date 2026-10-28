@@ -137,16 +137,8 @@ export async function MoonupPlugin({ client } = {}, options = {}) {
           account,
           "/v1/models?include=capabilities",
         );
-        if (!Array.isArray(body?.data))
-          throw new Error("moonup 返回的模型列表格式无效。");
         const models = Object.create(null);
         for (const model of body.data) {
-          if (typeof model?.id !== "string" || !model.id) continue;
-          if (!Array.isArray(model.protocols)) {
-            throw new Error(
-              "请升级 moonup 服务端，以支持插件自动识别模型协议。",
-            );
-          }
           const entry = runtimeModel(model, account.base);
           if (entry) models[model.id] = entry;
         }
@@ -187,6 +179,8 @@ function normalizeBase(value) {
  * Existing account IDs take precedence because Magpie associates model settings
  * with those IDs. The digest is a display discriminator rather than a credential
  * or authorization identifier, and its truncation is not a uniqueness guarantee.
+ * Credentials shorter than eight characters contribute no visible suffix because
+ * displaying four characters could otherwise reveal most or all of the supplied value.
  */
 function accountOf(auth, configuredBase) {
   if (
@@ -205,12 +199,13 @@ function accountOf(auth, configuredBase) {
     .update(base + "\0" + key)
     .digest("hex")
     .slice(0, 8);
-  // The digest distinguishes deployments sharing an origin and Keys sharing a
-  // visible suffix; the raw credential is never part of the displayed name.
+  // Short malformed credentials can contain fewer characters than a suffix;
+  // show only their digest so an invalid pasted value is not copied into account labels.
+  const suffix = key.length >= 8 ? ` …${key.slice(-4)}` : "";
   const name =
     auth.accountId ||
     auth.metadata?.email ||
-    `${new URL(base).host} …${key.slice(-4)} · ${digest}`;
+    `${new URL(base).host}${suffix} · ${digest}`;
   return { auth, base, key, name };
 }
 

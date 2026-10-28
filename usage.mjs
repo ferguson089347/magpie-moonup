@@ -50,10 +50,11 @@ export function usageOf(body, now = Date.now()) {
   );
   if (quota) out.windows.push(quota);
   for (const row of Array.isArray(body.rate_limits) ? body.rate_limits : []) {
-    const [name, span] = SPANS[row.window] || [
-      String(row.window || "Key window"),
-      undefined,
-    ];
+    // Unknown server windows retain their label and measured amounts, while
+    // only known periods contribute a duration; object prototype properties are not window definitions.
+    const [name, span] = (Object.hasOwn(SPANS, row.window)
+      ? SPANS[row.window]
+      : undefined) || [String(row.window || "Key window"), undefined];
     const window = windowOf(
       name,
       row.used,

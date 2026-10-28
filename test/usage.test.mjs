@@ -86,3 +86,21 @@ test("unavailable subscriptions and expired Keys retain their sign-in", () => {
   }
   assert.throws(() => usageOf({}), /格式无效/);
 });
+
+// Backends can introduce spending-window names beyond the plugin's three duration labels.
+// Unknown names, including object-property spellings, retain their measured amounts without inventing a reset duration.
+test("unrecognized spending windows remain displayable", () => {
+  const result = usageOf({
+    mode: "quota_limited",
+    rate_limits: [
+      { window: "constructor", used: 1, limit: 10 },
+      { window: "__proto__", used: 2, limit: 10 },
+      { window: "custom", used: 3, limit: 10 },
+    ],
+  });
+  assert.deepEqual(
+    result.windows.map((window) => window.name),
+    ["constructor", "__proto__", "custom"],
+  );
+  assert.ok(result.windows.every((window) => window.span === undefined));
+});

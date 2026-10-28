@@ -1,6 +1,6 @@
 {
   "name": "magpie-moonup",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "moonup models, subscriptions, key limits and wallet balance in Magpie",
   "type": "module",
   "main": "./index.mjs",
