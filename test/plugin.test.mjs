@@ -384,8 +384,8 @@ test("authenticated queries and generation refuse redirects", async (t) => {
 });
 
 // Two credentials can share their visible suffix while referring to independent accounts.
-// Stable account names include a digest, and saving one preserves its full metadata.
-test("account labels distinguish matching Key suffixes", async () => {
+// Readable names omit hashes, and private identities keep matching suffixes distinct while preserving metadata.
+test("readable account labels retain separate private identities", async () => {
   const saved = [];
   const hooks = await MoonupPlugin({
     client: { auth: { set: async (value) => saved.push(value) } },
@@ -397,13 +397,15 @@ test("account labels distinguish matching Key suffixes", async () => {
       metadata: { baseURL: "https://example.com/site", custom: "preserved" },
     }));
   }
-  assert.notEqual(saved[0].body.accountId, saved[1].body.accountId);
+  assert.equal(saved[0].body.accountId, "example.com · 密钥尾号 same");
+  assert.equal(saved[0].body.accountId, saved[1].body.accountId);
+  assert.notEqual(saved[0].body.uid, saved[1].body.uid);
   assert.equal(saved[0].body.metadata.custom, "preserved");
   assert.equal(saved[0].path.id, "moonup");
 });
 
 // An accidentally pasted short credential can fit entirely inside the usual four-character account hint.
-// Its saved label uses the nonsecret site and digest, while the original credential remains in authentication storage.
+// Its saved label uses the nonsecret site and a generic Key label, while authentication storage retains its credential.
 test("short invalid credentials are not displayed in account labels", async () => {
   const saved = [];
   const hooks = await MoonupPlugin({
@@ -416,6 +418,23 @@ test("short invalid credentials are not displayed in account labels", async () =
   }));
   assert.ok(!saved[0].body.accountId.includes("abcd"));
   assert.equal(saved[0].body.key, "abcd");
+  assert.equal(saved[0].body.accountId, "moonup.dev · API Key");
+});
+
+// Existing account names are identifiers for Magpie's saved model selections and account limits.
+// Loading a new plugin version keeps those identities and avoids silently writing a new account name.
+test("existing account identities remain stable across presentation updates", async () => {
+  const saved = [];
+  const hooks = await MoonupPlugin({
+    client: { auth: { set: async (value) => saved.push(value) } },
+  });
+  await hooks.auth.loader(async () => ({
+    type: "api",
+    key: "sk-fixture-cbed",
+    accountId: "moonup.dev …cbed · 69456bde",
+    metadata: { baseURL: "https://moonup.dev" },
+  }));
+  assert.equal(saved.length, 0);
 });
 
 // A refreshed model list with a malformed item must not replace previously usable entries with an empty result.
@@ -536,7 +555,7 @@ test("usage shows zero balance and separates funding from authentication failure
     metadata: { baseURL: fixture.base },
   };
   const usage = await hooks.auth.usage(async () => auth);
-  assert.equal(usage.plan, "moonup");
+  assert.equal(usage.plan, "余额 0.00 USD");
   assert.equal(usage.balance, "0.00 USD");
   assert.equal(usage.signIn, "kept");
   assert.match(usage.error, /余额或订阅/);
@@ -547,4 +566,35 @@ test("usage shows zero balance and separates funding from authentication failure
   await assert.rejects(hooks.provider.models({}, { auth: invalid }), {
     signIn: "expired",
   });
+});
+
+// Funding may be healthy while the authenticated Key's catalogue contains no usable text model.
+// Usage explains which site permission to inspect, while a nonempty catalogue leaves that message absent.
+test("an empty model catalogue produces an actionable account status", async (t) => {
+  t.mock.method(globalThis, "fetch", async () =>
+    Response.json({
+      mode: "unrestricted",
+      balance: 12.34,
+      billing: { source: "balance", available: true, unit: "USD" },
+    }),
+  );
+  const hooks = await MoonupPlugin();
+  const auth = {
+    type: "api",
+    key: "sk-fixture",
+    metadata: { baseURL: "https://moonup.dev" },
+  };
+  const empty = await hooks.auth.usage(async () => auth, { models: {} });
+  assert.equal(empty.plan, "余额 12.34 USD");
+  assert.match(empty.error, /检查分组和模型权限/);
+  assert.equal(empty.user, undefined);
+  const available = await hooks.auth.usage(async () => auth, {
+    models: { known: {} },
+  });
+  assert.equal(available.error, undefined);
+  const failed = await hooks.auth.usage(async () => auth, {
+    models: {},
+    fellBack: true,
+  });
+  assert.equal(failed.error, undefined);
 });

@@ -109,12 +109,24 @@ export async function MoonupPlugin({ client } = {}, options = {}) {
       /** usage returns funding windows or a user-visible query failure.
        * Query failures retain the sign-in unless the gateway returned 401.
        * Funding errors are reported by usageOf without changing the saved Key.
+       * A successfully empty account model catalogue adds an actionable note;
+       * the host supplies account labels, including any duplicate-name disambiguation.
        */
-      async usage(getAuth) {
+      async usage(getAuth, provider) {
         try {
           const account = accountOf(await getAuth(), configuredBase);
           const body = await queries.get(account, "/v1/usage");
-          return { user: account.name, ...usageOf(body) };
+          const result = usageOf(body);
+          if (
+            !result.error &&
+            provider?.models &&
+            !provider.fellBack &&
+            Object.keys(provider.models).length === 0
+          ) {
+            result.error =
+              "此密钥暂无可用对话模型，请在 moonup 密钥页检查分组和模型权限，再到 Magpie 获取模型。";
+          }
+          return result;
         } catch (error) {
           // Usage failures are displayed by Magpie, while an explicit sign-in
           // state keeps temporary network failures from revoking otherwise valid credentials.
@@ -176,11 +188,12 @@ function normalizeBase(value) {
 }
 
 /** accountOf resolves one saved Key and its stable display identity.
- * Saved addresses override plugin defaults. A short digest includes both the
+ * Saved addresses override plugin defaults. A private digest includes both the
  * deployment address and full Key to distinguish otherwise matching suffixes.
  * Existing account IDs take precedence because Magpie associates model settings
- * with those IDs. The digest is a display discriminator rather than a credential
- * or authorization identifier, and its truncation is not a uniqueness guarantee.
+ * with those IDs. New accounts display the site and Key suffix while their
+ * digest is saved as a private uid, allowing the host to distinguish accounts
+ * with matching visible names. Usage lets the host retain its disambiguated label.
  * Credentials shorter than eight characters contribute no visible suffix because
  * displaying four characters could otherwise reveal most or all of the supplied value.
  */
@@ -196,30 +209,33 @@ function accountOf(auth, configuredBase) {
   }
   const base = normalizeBase(auth.metadata?.baseURL || configuredBase);
   const key = auth.key.trim();
-  // Eight hexadecimal characters keep the display discriminator compact.
-  const digest = createHash("sha256")
+  const identity = createHash("sha256")
     .update(base + "\0" + key)
-    .digest("hex")
-    .slice(0, 8);
+    .digest("hex");
   // Short malformed credentials can contain fewer characters than a suffix;
-  // show only their digest so an invalid pasted value is not copied into account labels.
-  const suffix = key.length >= 8 ? ` …${key.slice(-4)}` : "";
+  // omit their hint so an invalid pasted value is not copied into account labels.
+  const suffix =
+    key.length >= 8 ? ` · 密钥尾号 ${key.slice(-4)}` : " · API Key";
   const name =
-    auth.accountId ||
-    auth.metadata?.email ||
-    `${new URL(base).host}${suffix} · ${digest}`;
-  return { auth, base, key, name };
+    auth.accountId || auth.metadata?.email || `${new URL(base).host}${suffix}`;
+  return { auth, base, key, name, identity };
 }
 
 /** nameAccount persists a stable label in Magpie's current account scope.
- * Existing account identities remain unchanged. Storage failures propagate so
+ * Existing account identities remain unchanged. New accounts receive a private
+ * uid so matching visible suffixes do not identify the same credential.
+ * Storage failures propagate so
  * the host can report an unsuccessful account update instead of silently losing it.
  */
 async function nameAccount(client, account) {
   if (account.auth.accountId || !client?.auth?.set) return;
   await client.auth.set({
     path: { id: PROVIDER },
-    body: { ...account.auth, accountId: account.name },
+    body: {
+      ...account.auth,
+      accountId: account.name,
+      uid: account.auth.uid || account.identity,
+    },
   });
 }
 
