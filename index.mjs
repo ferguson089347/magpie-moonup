@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { createQueries } from "./queries.mjs";
 import { usageOf } from "./usage.mjs";
 
 // index.mjs connects Magpie accounts to moonup's authenticated model
@@ -11,8 +12,9 @@ import { usageOf } from "./usage.mjs";
 // that account's address and credentials, replaces caller authentication, and
 // returns the upstream response without reading its stream. The loader's /v1
 // base is shared by the text APIs; Gemini paths are rewritten to /v1beta.
-// Metadata queries have a bounded timeout, while generation retains the
-// caller's cancellation signal and can stream for as long as the caller allows.
+// Metadata queries share account-isolated short-lived results and have bounded
+// responses, while generation retains the caller's cancellation signal and can
+// stream for as long as the caller allows.
 
 // PROVIDER and ENDPOINTS define the public provider identity and supported
 // text transports; catalogue permissions decide which entries each model uses.
@@ -31,10 +33,6 @@ const SITE_OPTIONS = [
   { label: "api.moonup.dev", value: "https://api.moonup.dev" },
 ];
 
-// QUERY_TIMEOUT_MS bounds only read-only metadata calls; generation requests
-// retain the caller's own cancellation lifetime and have no added deadline.
-const QUERY_TIMEOUT_MS = 15_000;
-
 /** MoonupPlugin supplies per-Key models, generation, and usage to Magpie.
  * New accounts select a built-in moonup address before supplying their Key.
  * A configured baseURL skips that selection; saved account addresses take
@@ -43,6 +41,7 @@ const QUERY_TIMEOUT_MS = 15_000;
  */
 export async function MoonupPlugin({ client } = {}, options = {}) {
   const configuredBase = options.baseURL ? normalizeBase(options.baseURL) : "";
+  const queries = createQueries();
   const sitePrompt = {
     type: "select",
     key: "baseURL",
@@ -102,7 +101,7 @@ export async function MoonupPlugin({ client } = {}, options = {}) {
         return {
           baseURL: account.base + "/v1",
           apiKey: "moonup-plugin",
-          fetch: (input, init) => forward(account, input, init),
+          fetch: (input, init) => forward(account, input, init, queries),
         };
       },
       /** usage returns funding windows or a user-visible query failure.
@@ -112,7 +111,7 @@ export async function MoonupPlugin({ client } = {}, options = {}) {
       async usage(getAuth) {
         try {
           const account = accountOf(await getAuth(), configuredBase);
-          const body = await query(account, "/v1/usage");
+          const body = await queries.get(account, "/v1/usage");
           return { user: account.name, ...usageOf(body) };
         } catch (error) {
           // Usage failures are displayed by Magpie, while an explicit sign-in
@@ -134,7 +133,10 @@ export async function MoonupPlugin({ client } = {}, options = {}) {
       async models(_provider, { auth } = {}) {
         const account = accountOf(auth, configuredBase);
         await nameAccount(client, account);
-        const body = await query(account, "/v1/models?include=capabilities");
+        const body = await queries.get(
+          account,
+          "/v1/models?include=capabilities",
+        );
         if (!Array.isArray(body?.data))
           throw new Error("moonup 返回的模型列表格式无效。");
         const models = Object.create(null);
@@ -222,53 +224,6 @@ async function nameAccount(client, account) {
     path: { id: PROVIDER },
     body: { ...account.auth, accountId: account.name },
   });
-}
-
-/** query fetches authenticated catalogue or usage JSON with a bounded timeout.
- * Redirects are refused. Errors expose fixed messages and HTTP status rather
- * than reflecting a server body that could contain a submitted credential.
- */
-async function query(account, path) {
-  let response;
-  try {
-    response = await fetch(account.base + path, {
-      headers: {
-        Authorization: `Bearer ${account.key}`,
-        Accept: "application/json",
-      },
-      redirect: "error",
-      signal: AbortSignal.timeout(QUERY_TIMEOUT_MS),
-    });
-  } catch {
-    // Network errors can contain URLs or redirect details. Use a fixed message
-    // that preserves credentials and tells users which configuration to check.
-    throw new Error("无法连接 moonup，请检查站点地址、网络和代理。");
-  }
-  if (!response.ok) {
-    // Failed metadata replies are not consumed. Release their body before
-    // reporting the HTTP status; cleanup failure must not conceal credential rejection.
-    await response.body?.cancel().catch(() => undefined);
-    // Metadata requests are read-only, but gateway authentication still rejects
-    // invalid credentials with 401; only that status asks Magpie for another sign-in.
-    const messages = {
-      401: "API key 无效，请重新添加。",
-      403: "此 API key 无权访问，请检查密钥和分组权限。",
-      429: "查询过于频繁，请稍后重试。",
-    };
-    const message =
-      messages[response.status] ||
-      `moonup 查询失败（HTTP ${response.status}）。`;
-    throw Object.assign(new Error(message), {
-      signIn: response.status === 401 ? "expired" : "kept",
-    });
-  }
-  try {
-    return await response.json();
-  } catch {
-    // A successful non-JSON reply commonly comes from a frontend or proxy;
-    // report the address mismatch without exposing the returned page's contents.
-    throw new Error("moonup 未返回 JSON，请检查是否填写了正确的 API 地址。");
-  }
 }
 
 /** runtimeModel converts explicit gateway capabilities to one Magpie model.
@@ -364,8 +319,9 @@ function runtimeModel(model, base) {
  * The loader base takes precedence over model URLs in Magpie, so the rewrite
  * permits one account to serve Gemini alongside Messages, Responses, and Chat.
  * Request bodies and public model IDs are passed through without decoding.
+ * A returned 401 clears this account's cached model and usage observations.
  */
-async function forward(account, input, init) {
+async function forward(account, input, init, queries) {
   const request = new Request(input, init);
   const url = new URL(request.url);
   const base = new URL(account.base);
@@ -374,9 +330,10 @@ async function forward(account, input, init) {
     throw new Error("模型请求地址与当前 moonup 账号不一致。");
   }
   const operation = url.pathname.slice(prefix.length);
-  const gemini = /^models\/.+:(?:streamGenerateContent|generateContent)$/.test(
-    operation,
-  );
+  const gemini =
+    /^models\/.+:(?:streamGenerateContent|generateContent|countTokens)$/.test(
+      operation,
+    );
   if (
     !gemini &&
     ![
@@ -404,5 +361,12 @@ async function forward(account, input, init) {
       headers.set("anthropic-version", "2023-06-01");
   }
   if (gemini) headers.set("x-goog-api-key", account.key);
-  return fetch(new Request(url, request), { headers, redirect: "error" });
+  const response = await fetch(new Request(url, request), {
+    headers,
+    redirect: "error",
+  });
+  // A rejected credential must not retain successful catalogue or quota
+  // observations from before the backend revoked or replaced that account's Key.
+  if (response.status === 401) queries.clear(account);
+  return response;
 }

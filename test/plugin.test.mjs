@@ -278,6 +278,62 @@ test("generation isolates Keys and forwards all four text protocols", async (t) 
   );
 });
 
+// Gemini token counting shares the account loader with generation requests.
+// Its version path and account authentication must match native Gemini while the counting body remains unchanged.
+test("Gemini token counting reaches its native endpoint", async (t) => {
+  const fixture = await gateway(t);
+  const hooks = await MoonupPlugin();
+  const loader = await hooks.auth.loader(async () => ({
+    type: "api",
+    key: "sk-first",
+    metadata: { baseURL: fixture.base },
+  }));
+  const body = JSON.stringify({ contents: [{ parts: [{ text: "hello" }] }] });
+  const response = await loader.fetch(
+    loader.baseURL + "/models/custom:countTokens",
+    {
+      method: "POST",
+      body,
+    },
+  );
+  await response.text();
+  const request = fixture.requests.at(-1);
+  assert.equal(request.url, "/site/v1beta/models/custom:countTokens");
+  assert.equal(request.headers["x-goog-api-key"], "sk-first");
+  assert.equal(request.body, body);
+});
+
+// The same account can load its catalogue successfully before generation rejects its credential.
+// That returned 401 must invalidate the metadata cache so the next refresh asks the backend again.
+test("generation credential rejection invalidates cached models", async (t) => {
+  let modelQueries = 0;
+  t.mock.method(globalThis, "fetch", async (input) => {
+    const url = typeof input === "string" ? input : input.url;
+    if (url.includes("/models?")) {
+      modelQueries++;
+      return Response.json({ data: [] });
+    }
+    return new Response("unauthorized", { status: 401 });
+  });
+  const hooks = await MoonupPlugin();
+  const auth = {
+    type: "api",
+    key: "sk-first",
+    metadata: { baseURL: "https://moonup.dev" },
+  };
+  await hooks.provider.models({}, { auth });
+  await hooks.provider.models({}, { auth });
+  assert.equal(modelQueries, 1);
+  const loader = await hooks.auth.loader(async () => auth);
+  const response = await loader.fetch(loader.baseURL + "/responses", {
+    method: "POST",
+    body: "{}",
+  });
+  assert.equal(response.status, 401);
+  await hooks.provider.models({}, { auth });
+  assert.equal(modelQueries, 2);
+});
+
 // An upstream can keep its response open after sending the first SSE chunk.
 // Fetch returns that chunk immediately, and cancellation interrupts the still-open stream.
 test(

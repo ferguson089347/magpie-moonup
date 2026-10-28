@@ -1,6 +1,6 @@
 {
   "name": "magpie-moonup",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "moonup models, subscriptions, key limits and wallet balance in Magpie",
   "type": "module",
   "main": "./index.mjs",
@@ -8,11 +8,12 @@
   "files": [
     "index.mjs",
     "usage.mjs",
+    "queries.mjs",
     "README.md",
     "LICENSE"
   ],
   "scripts": {
-    "check": "node --check index.mjs && node --check usage.mjs",
+    "check": "node --check index.mjs && node --check usage.mjs && node --check queries.mjs",
     "test": "node --test test/*.test.mjs"
   },
   "keywords": [
