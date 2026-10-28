@@ -187,7 +187,7 @@ test("malformed model payloads do not become cached empty or partial catalogues"
     null,
     {},
     { data: [null] },
-    { data: [{ id: "bad" }] },
+    { data: [{ id: "bad", protocols: null }] },
     { data: [{ id: "bad", protocols: [null] }] },
     { data: [{ id: "bad", protocols: [], native_protocols: [null] }] },
     {
@@ -215,7 +215,7 @@ test("malformed model payloads do not become cached empty or partial catalogues"
   const queries = createQueries();
   for (let index = 0; index < invalid.length; index++) {
     queries.clear(ACCOUNT);
-    await assert.rejects(queries.get(ACCOUNT, MODEL_PATH), /格式无效|升级/);
+    await assert.rejects(queries.get(ACCOUNT, MODEL_PATH), /格式无效/);
     assert.equal(
       (await queries.get(ACCOUNT, MODEL_PATH)).data[0].id,
       "recovered",
@@ -248,4 +248,22 @@ test("malformed usage metadata can recover on the next refresh", async (t) => {
     await assert.rejects(queries.get(ACCOUNT, "/v1/usage"), /格式无效/);
     assert.equal((await queries.get(ACCOUNT, "/v1/usage")).balance, 10);
   }
+});
+
+// A legacy catalogue omits protocol fields, while a modern catalogue can explicitly supply an empty protocol array.
+// Both forms remain valid cached observations, and the distinction survives detached copies for endpoint selection.
+test("legacy and explicit protocol metadata remain distinguishable", async (t) => {
+  let calls = 0;
+  t.mock.method(globalThis, "fetch", async () => {
+    calls++;
+    return Response.json({
+      data: [{ id: "legacy-model" }, { id: "explicit-empty", protocols: [] }],
+    });
+  });
+  const queries = createQueries();
+  const first = await queries.get(ACCOUNT, MODEL_PATH);
+  const second = await queries.get(ACCOUNT, MODEL_PATH);
+  assert.ok(!Object.hasOwn(first.data[0], "protocols"));
+  assert.deepEqual(second.data[1].protocols, []);
+  assert.equal(calls, 1);
 });

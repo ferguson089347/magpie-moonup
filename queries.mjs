@@ -97,9 +97,10 @@ export function createQueries() {
 /** validateMetadata rejects malformed model and usage observations before caching.
  * An empty model array is valid, while a malformed entry rejects the whole
  * response so a partial catalogue cannot replace the host's previous list.
- * Missing model protocols retain the server-upgrade explanation. Usage mode,
- * funding objects, and spending-window rows follow the public response shape;
- * absent optional amounts remain unknown for the usage presentation layer.
+ * Legacy models may omit protocols, while supplied protocol fields are
+ * validated as arrays. Usage mode, funding objects, and spending-window rows
+ * follow the public response shape; absent optional amounts remain unknown
+ * for the usage presentation layer.
  */
 function validateMetadata(value, path) {
   const object =
@@ -120,13 +121,12 @@ function validateMetadata(value, path) {
       ) {
         throw new Error("moonup 返回的模型条目格式无效，请稍后刷新重试。");
       }
-      if (!Array.isArray(model.protocols)) {
-        throw new Error("请升级 moonup 服务端，以支持插件自动识别模型协议。");
-      }
       if (
-        model.protocols.some(
-          (protocol) => typeof protocol !== "string" || !protocol,
-        )
+        Object.hasOwn(model, "protocols") &&
+        (!Array.isArray(model.protocols) ||
+          model.protocols.some(
+            (protocol) => typeof protocol !== "string" || !protocol,
+          ))
       ) {
         throw new Error("moonup 返回的模型协议格式无效，请稍后刷新重试。");
       }

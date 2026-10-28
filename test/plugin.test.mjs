@@ -442,6 +442,89 @@ test("invalid model responses fail refresh and allow immediate recovery", async 
   assert.equal(calls, 2);
 });
 
+// Deployed Sub2API-compatible gateways can return standard model lists without protocol metadata.
+// Common model families remain usable through their corresponding text endpoints, including composite-prefixed IDs and unknown compatible models.
+test("legacy model lists load without requiring a server upgrade", async (t) => {
+  const ids = [
+    "claude-sonnet-4-6",
+    "gpt-6.1-sol",
+    "work/gemini-3-pro",
+    "deepseek-chat",
+    "work/gpt-5.4",
+  ];
+  t.mock.method(globalThis, "fetch", async () =>
+    Response.json({
+      object: "list",
+      data: ids.map((id) => ({ id, object: "model", owned_by: "moonup" })),
+    }),
+  );
+  const hooks = await MoonupPlugin();
+  const auth = {
+    type: "api",
+    key: "sk-fixture",
+    metadata: { baseURL: "https://moonup.dev" },
+  };
+  const models = await hooks.provider.models({}, { auth });
+  assert.deepEqual(Object.keys(models), ids);
+  assert.deepEqual(
+    ids.map((id) => models[id].api.npm),
+    [
+      "@ai-sdk/anthropic",
+      "@ai-sdk/openai",
+      "@ai-sdk/google",
+      "@ai-sdk/openai-compatible",
+      "@ai-sdk/openai",
+    ],
+  );
+  assert.equal(models["work/gpt-5.4"].api.id, "work/gpt-5.4");
+  assert.equal(
+    models["work/gemini-3-pro"].api.url,
+    "https://moonup.dev/v1beta",
+  );
+  assert.deepEqual(models["gpt-6.1-sol"].capabilities, {});
+});
+
+// A legacy alias may not resemble its vendor's usual model family.
+// Exact overrides select its text endpoint, while explicit server permissions and empty protocol lists remain authoritative.
+test("legacy protocol overrides preserve explicit server restrictions", async (t) => {
+  t.mock.method(globalThis, "fetch", async () =>
+    Response.json({
+      data: [
+        { id: "custom-alias" },
+        { id: "gpt-chat-only", protocols: ["openai_chat_completions"] },
+        { id: "claude-disabled", protocols: [] },
+      ],
+    }),
+  );
+  const hooks = await MoonupPlugin(
+    {},
+    {
+      modelProtocols: {
+        "custom-alias": "anthropic_messages",
+        "gpt-chat-only": "openai_responses",
+        "claude-disabled": "anthropic_messages",
+      },
+    },
+  );
+  const auth = {
+    type: "api",
+    key: "sk-fixture",
+    metadata: { baseURL: "https://moonup.dev" },
+  };
+  const models = await hooks.provider.models({}, { auth });
+  assert.equal(models["custom-alias"].api.npm, "@ai-sdk/anthropic");
+  assert.equal(models["gpt-chat-only"].api.npm, "@ai-sdk/openai-compatible");
+  assert.ok(!Object.hasOwn(models, "claude-disabled"));
+  await assert.rejects(
+    MoonupPlugin({}, { modelProtocols: { alias: "typo" } }),
+    /modelProtocols/,
+  );
+  await assert.rejects(
+    MoonupPlugin({}, { modelProtocols: [] }),
+    /modelProtocols/,
+  );
+});
+
 // A zero wallet balance is a measured value rather than missing information.
 // Authentication failures request sign-in, while exhausted funds keep the existing credential.
 test("usage shows zero balance and separates funding from authentication failure", async (t) => {

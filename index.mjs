@@ -5,8 +5,9 @@ import { usageOf } from "./usage.mjs";
 // index.mjs connects Magpie accounts to moonup's authenticated model
 // catalogue and generation endpoints. One account holds one site's API Key;
 // the gateway owns group selection, aliases, protocol conversion, and billing.
-// The plugin exposes only models and capabilities reported for that Key, so
-// arbitrary aliases and composite prefixes never require client-side guessing.
+// The plugin exposes model IDs reported for that Key and uses explicit
+// protocol permissions when available. Legacy lists use common model families
+// to choose a text API, with exact protocol overrides for custom aliases.
 //
 // Magpie selects the account before invoking its loader. Each loader captures
 // that account's address and credentials, replaces caller authentication, and
@@ -41,6 +42,7 @@ const SITE_OPTIONS = [
  */
 export async function MoonupPlugin({ client } = {}, options = {}) {
   const configuredBase = options.baseURL ? normalizeBase(options.baseURL) : "";
+  const modelProtocols = validateModelProtocols(options.modelProtocols);
   const queries = createQueries();
   const sitePrompt = {
     type: "select",
@@ -139,7 +141,7 @@ export async function MoonupPlugin({ client } = {}, options = {}) {
         );
         const models = Object.create(null);
         for (const model of body.data) {
-          const entry = runtimeModel(model, account.base);
+          const entry = runtimeModel(model, account.base, modelProtocols);
           if (entry) models[model.id] = entry;
         }
         return models;
@@ -221,22 +223,23 @@ async function nameAccount(client, account) {
   });
 }
 
-/** runtimeModel converts explicit gateway capabilities to one Magpie model.
- * Unsupported non-text protocols return undefined. Native allowed endpoints
- * take precedence, followed by a fixed protocol order; public IDs remain exact.
+/** runtimeModel converts gateway metadata or a legacy model to one Magpie model.
+ * Supplied non-text-only protocols return undefined. Native allowed endpoints
+ * take precedence, followed by a fixed protocol order; legacy endpoint selection
+ * uses protocolsOf and public IDs remain exact.
  * Missing numeric limits and capability flags remain absent rather than guessed.
  * The gateway reports common capabilities across eligible routes, so the result
  * uses those restrictions even when another route offers larger limits. Exact
  * reasoning choices are exposed as variants without introducing additional models.
  */
-function runtimeModel(model, base) {
+function runtimeModel(model, base, overrides) {
+  const protocols = protocolsOf(model, overrides);
   const native = Array.isArray(model.native_protocols)
     ? model.native_protocols
     : [];
   const endpoint =
-    ENDPOINTS.find(
-      ([id]) => model.protocols.includes(id) && native.includes(id),
-    ) || ENDPOINTS.find(([id]) => model.protocols.includes(id));
+    ENDPOINTS.find(([id]) => protocols.includes(id) && native.includes(id)) ||
+    ENDPOINTS.find(([id]) => protocols.includes(id));
   if (!endpoint) return undefined;
   const [, npm, suffix] = endpoint;
   const attrs = model.attributes || {};
@@ -305,6 +308,49 @@ function runtimeModel(model, base) {
     headers: {},
     options: {},
   };
+}
+
+/** protocolsOf chooses text protocol candidates for one authenticated model.
+ * Supplied server permissions take precedence, including an explicitly empty
+ * list. Only legacy entries lacking the field consult exact model overrides
+ * and then recognizable family names. Composite prefixes are removed solely
+ * for that family check; the transmitted model ID remains unchanged. Unknown
+ * names use Chat Completions, so nonstandard aliases or restricted groups may
+ * need an override until the server provides protocol metadata.
+ */
+function protocolsOf(model, overrides) {
+  if (Object.hasOwn(model, "protocols")) return model.protocols;
+  if (Object.hasOwn(overrides, model.id)) return [overrides[model.id]];
+  // Standard Sub2API catalogues omit protocol permissions. Use their common
+  // model-family convention only for missing metadata, preserving explicit server restrictions above.
+  const family = model.id.slice(model.id.lastIndexOf("/") + 1).toLowerCase();
+  if (/^claude(?:[-_.]|$)/.test(family)) return ["anthropic_messages"];
+  if (/^(?:gpt[-_.]|chatgpt[-_.]|codex[-_.]|o\d)/.test(family))
+    return ["openai_responses"];
+  if (/^gemini(?:[-_.]|$)/.test(family)) return ["gemini_generate_content"];
+  return ["openai_chat_completions"];
+}
+
+/** validateModelProtocols checks optional exact overrides for legacy model IDs.
+ * Values use the four documented text protocol identifiers. Unknown identifiers
+ * and non-object configurations fail during plugin loading so misspelled settings
+ * cannot silently send a legacy alias through an unintended endpoint.
+ */
+function validateModelProtocols(value) {
+  if (value == null) return Object.create(null);
+  if (
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    Object.entries(value).some(
+      ([model, protocol]) =>
+        !model || !ENDPOINTS.some(([id]) => id === protocol),
+    )
+  ) {
+    throw new Error(
+      "modelProtocols 需要使用完整模型 ID 和支持的文本协议名称。",
+    );
+  }
+  return { ...value };
 }
 
 /** forward sends one generation request with its selected account credentials.
