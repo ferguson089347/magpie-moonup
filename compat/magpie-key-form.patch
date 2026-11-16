@@ -1,0 +1,427 @@
+diff --git a/internal/plugin/host.js b/internal/plugin/host.js
+--- a/internal/plugin/host.js
++++ b/internal/plugin/host.js
+@@ -1381,7 +1381,24 @@
+     type: m.type,
+     label: m.label,
+     ...(m.type === "api" && shown(m.placeholder, 200) ? { placeholder: shown(m.placeholder, 200) } : {}),
++    ...(m.type === "api" && m.keyForm && typeof m.keyForm === "object" ? { keyForm: keyFormOf(m.keyForm) } : {}),
+   }))
++}
++
++// Key-form hints are display data; no secret or executable URL crosses to the GUI.
++function keyFormOf(form) {
++  let keysURL = ""
++  try {
++    const url = new URL(form.keysURL)
++    if (["https:", "http:"].includes(url.protocol) && !url.username && !url.password) keysURL = url.href
++  } catch {}
++  const seen = new Set()
++  const protocols = (Array.isArray(form.protocols) ? form.protocols : []).slice(0, 10).flatMap((p) => {
++    if (typeof p?.value !== "string" || p.value.length > 100 || !shown(p.label, 100) || seen.has(p.value)) return []
++    seen.add(p.value)
++    return [{ label: shown(p.label, 100), value: p.value }]
++  })
++  return { keysURL, protocols }
+ }
+ 
+ // iconOf is the picture a plugin gives its provider, magpie's own field
+diff --git a/internal/plugin/providers.go b/internal/plugin/providers.go
+--- a/internal/plugin/providers.go
++++ b/internal/plugin/providers.go
+@@ -26,6 +26,18 @@
+ 	// Placeholder is the hint an "api" method gives in its key's field
+ 	// (magpie's own field: OpenCode's says "API key")
+ 	Placeholder string `json:"placeholder,omitempty"`
++	// KeyForm opts an API method into the native named/bulk Key form.
++	KeyForm *KeyForm `json:"keyForm,omitempty"`
++}
++
++type KeyForm struct {
++	KeysURL   string        `json:"keysURL,omitempty"`
++	Protocols []KeyProtocol `json:"protocols,omitempty"`
++}
++
++type KeyProtocol struct {
++	Label string `json:"label"`
++	Value string `json:"value"`
+ }
+ 
+ // KeyTitle is what an "api" method's key is asked as: its label, as
+diff --git a/internal/plugin/key_form_test.go b/internal/plugin/key_form_test.go
+new file mode 100644
+--- /dev/null
++++ b/internal/plugin/key_form_test.go
+@@ -0,0 +1,67 @@
++package plugin
++
++import (
++	"context"
++	"os"
++	"path/filepath"
++	"testing"
++	"time"
++)
++
++// Key forms are optional display hints. Existing methods keep their shape;
++// executable URLs and malformed protocol options never reach the GUI.
++func TestPluginKeyForm(t *testing.T) {
++	sandbox(t)
++	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
++	defer cancel()
++	dir := t.TempDir()
++	for name, body := range map[string]string{
++		"package.json": `{"name":"key-form-fixture","type":"module","main":"index.mjs"}`,
++		"index.mjs": `export const Forms = async () => ({
++  auth: { provider: "forms", methods: [
++    { type: "api", label: "Key", keyForm: {
++      keysURL: "https://forms.example/keys", protocols: [
++        {label:"Any protocol", value:""}, {label:"Anthropic", value:"anthropic_messages"},
++        {label:"Duplicate", value:"anthropic_messages"}, {label:"Bad", value:123}, null
++      ]
++    } },
++    { type: "api", label: "Unsafe", keyForm: {keysURL:"javascript:alert(1)"} },
++    { type: "oauth", label: "Browser", keyForm: {keysURL:"https://forms.example/keys"} }
++  ] }
++})`,
++	} {
++		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o600); err != nil {
++			t.Fatal(err)
++		}
++	}
++	if _, err := Add(ctx, dir); err != nil {
++		t.Fatal(err)
++	}
++	providers, err := Providers(ctx)
++	if err != nil {
++		t.Fatal(err)
++	}
++	for _, provider := range providers {
++		if provider.ID != "forms" {
++			continue
++		}
++		if len(provider.Methods) != 3 {
++			t.Fatalf("methods = %+v", provider.Methods)
++		}
++		form := provider.Methods[0].KeyForm
++		if form == nil || form.KeysURL != "https://forms.example/keys" || len(form.Protocols) != 2 {
++			t.Fatalf("key form = %+v", form)
++		}
++		if form.Protocols[1].Value != "anthropic_messages" {
++			t.Errorf("protocol = %+v", form.Protocols[1])
++		}
++		if bad := provider.Methods[1].KeyForm; bad == nil || bad.KeysURL != "" {
++			t.Errorf("executable key URL was not removed: %+v", bad)
++		}
++		if provider.Methods[2].KeyForm != nil {
++			t.Error("an OAuth method received a Key form")
++		}
++		return
++	}
++	t.Fatal("key form provider was not listed")
++}
+diff --git a/internal/gui/assets/app.js b/internal/gui/assets/app.js
+--- a/internal/gui/assets/app.js
++++ b/internal/gui/assets/app.js
+@@ -11217,6 +11217,7 @@
+ // renderPluginAsk: a plugin sign-in's step before the browser — the way
+ // to sign in, a question, or the key.
+ function renderPluginAsk(sub) {
++  if (signing.state === "key" && sub.plugin.methods?.[signing.method]?.keyForm) return renderPluginKeyForm(sub);
+   const box = el("div", "signing plugin-ask");
+   const tt = el("span", "tt");
+   box.append(tt);
+@@ -11279,6 +11280,118 @@
+   tt.append(form, why);
+   box.append(close);
+   setTimeout(() => { if (inp.isConnected && !inp.disabled) inp.focus({ preventScroll: true }); });
++  return box;
++}
++
++// renderPluginKeyForm keeps plugin credentials in plugin-auth.json while using
++// the same fields, menu and batch parser as the native provider Key editor.
++function renderPluginKeyForm(sub) {
++  const flow = signing;
++  const way = sub.plugin.methods[flow.method];
++  const form = way.keyForm;
++  const box = el("div", "acc adding plugin-key-form");
++  const name = input(flow.name || "", t("Name (optional), e.g. Team"));
++  name.setAttribute("aria-label", t("Name (optional), e.g. Team"));
++  name.maxLength = 100;
++  name.disabled = !!flow.busy;
++  name.oninput = () => { flow.name = name.value; };
++  const key = flow.bulk ? el("textarea", "bulk-keys") : input(flow.value || "", t("paste an API key"), "password");
++  if (flow.bulk) {
++    key.rows = 5;
++    key.value = flow.value || "";
++    key.spellcheck = false;
++    key.placeholder = t("Paste the keys, one a line or separated by commas");
++  }
++  key.autocomplete = "off";
++  key.setAttribute("aria-label", way.label || t("API key"));
++  key.disabled = !!flow.busy;
++  const add = el("button", "text primary", t("Add"));
++  const count = el("span", "hint bulk-count");
++  const counted = () => {
++    const n = splitKeys(key.value).length;
++    count.textContent = flow.bulk && n ? t(n === 1 ? "1 key" : "{n} keys", { n }) : "";
++    add.disabled = !!flow.busy || !n;
++  };
++  key.oninput = () => { flow.value = key.value; counted(); };
++  key.onpaste = (e) => {
++    const text = e.clipboardData?.getData("text") || "";
++    if (flow.bulk || splitKeys(text).length < 2) return;
++    e.preventDefault();
++    signing = { ...flow, value: text, bulk: true };
++    renderProviders();
++  };
++  counted();
++  const submit = async () => {
++    const pending = splitKeys(key.value);
++    if (signing !== flow || flow.busy || !pending.length) return;
++    const busy = signing = { ...flow, busy: true };
++    renderProviders();
++    let last;
++    try {
++      while (pending.length) {
++        if (signing !== busy) return;
++        const inputs = { ...flow.inputs, protocol: flow.protocol || "" };
++        if (!flow.bulk && name.value.trim()) inputs.name = name.value.trim();
++        last = await api("plugin-signin", { provider: sub.pid, method: flow.method, inputs, key: pending[0] });
++        pending.shift();
++      }
++    } catch (e) {
++      if (signing !== busy) return;
++      // Already saved Keys stay saved; retry only the unprocessed remainder.
++      signing = { ...flow, value: pending.join("\n"), bulk: flow.bulk || pending.length > 1, error: e.message };
++      try { providers = await api("providers"); } catch (_) {}
++      renderProviders();
++      return;
++    }
++    if (signing !== busy) return;
++    try { await signedIn(last); } catch (e) { status(e.message, "err"); }
++  };
++  add.onclick = submit;
++  const cancel = el("button", "text", t("Cancel"));
++  cancel.disabled = !!flow.busy;
++  cancel.onclick = cancelSignIn;
++  const bar = el("div", "kb");
++  if (form.keysURL) {
++    const get = el("button", "link", t("Get a key ↗"));
++    get.onclick = () => api("open", { url: form.keysURL }).catch((e) => status(e.message, "err"));
++    bar.append(get);
++  }
++  const many = el("button", "link", t(flow.bulk ? "Add one key" : "Paste several"));
++  many.disabled = !!flow.busy;
++  many.onclick = () => { signing = { ...flow, bulk: !flow.bulk }; renderProviders(); };
++  bar.append(many);
++  const protocols = [{ label: "Any protocol", value: "" }, ...(form.protocols || []).filter((p) => p.value)];
++  if (protocols.length > 1) {
++    const proto = el("button", "proto" + (flow.protocol ? " set" : ""));
++    proto.disabled = !!flow.busy;
++    const paint = () => proto.replaceChildren(el("span", "", t(protocols.find((p) => p.value === (flow.protocol || ""))?.label || "Any protocol")), svg(CHEV, 11, 1.6));
++    paint();
++    proto.onclick = (e) => {
++      e.stopPropagation();
++      if (proto.classList.contains("open")) return closeProtoMenu();
++      openProtoMenu(proto, protocols.map((p) => ({ v: p.value, name: t(p.label), note: "" })), flow.protocol || "", (value) => {
++        flow.protocol = value;
++        proto.classList.toggle("set", !!value);
++        paint();
++      });
++    };
++    bar.append(proto);
++  }
++  bar.append(count, el("span", "grow"), cancel, add);
++  if (flow.bulk) box.append(key);
++  else {
++    const fields = el("div", "kf");
++    fields.append(name, key);
++    box.append(fields);
++  }
++  box.append(bar);
++  if (flow.error) box.append(el("span", "hint why", flow.error));
++  for (const field of [name, key]) field.onkeydown = (e) => {
++    e.stopPropagation();
++    if (e.key === "Enter" && (!flow.bulk || e.ctrlKey || e.metaKey)) { e.preventDefault(); submit(); }
++    if (e.key === "Escape" && !flow.busy) cancelSignIn();
++  };
++  queueMicrotask(() => { if (key.isConnected && !key.disabled) key.focus({ preventScroll: true }); });
+   return box;
+ }
+ 
+@@ -12037,7 +12150,8 @@
+     const add = el("button", "acc add");
+     const ic = el("span", "dot");
+     ic.append(svg(PLUS, 10, 1.8));
+-    add.append(ic, el("span", "n", t(sub.single ? "Sign in to another {name} account" : "Add another {name} account", { name: sub.name })));
++    const keyForm = sub.plugin?.methods?.length === 1 && sub.plugin.methods[0].type === "api" && sub.plugin.methods[0].keyForm;
++    add.append(ic, el("span", "n", t(sub.single ? "Sign in to another {name} account" : keyForm ? "Add another key" : "Add another {name} account", { name: sub.name })));
+     add.onclick = () => startSignIn(a.agent);
+     list.append(add);
+     if (sub.importable) {
+diff --git a/internal/gui/assets/app.css b/internal/gui/assets/app.css
+--- a/internal/gui/assets/app.css
++++ b/internal/gui/assets/app.css
+@@ -2262,6 +2262,7 @@
+ .acc.adding .kf { display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 3fr); gap: 6px; }
+ .acc.adding .kb { display: flex; align-items: center; gap: 4px; }
+ .acc.adding .kb .grow { flex: 1; }
++.plugin-key-form .kb { flex-wrap: wrap; row-gap: 6px; }
+ .acc + .acc.adding { border-top: 1px solid var(--line-2); }
+ @media (max-width: 520px) { .acc.adding .kf { grid-template-columns: 1fr; } }
+ .acc.adding .bulk-keys { width: 100%; box-sizing: border-box; resize: vertical; min-height: 84px; font-family: var(--code-font, var(--code)); font-size: 11.5px; line-height: 1.5; padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--card); color: var(--fg); }
+diff --git a/internal/gui/tests/plugin-key-form.test.cjs b/internal/gui/tests/plugin-key-form.test.cjs
+new file mode 100644
+--- /dev/null
++++ b/internal/gui/tests/plugin-key-form.test.cjs
+@@ -0,0 +1,129 @@
++// Native plugin Key forms keep legacy accounts and use the plugin sign-in API.
++// Every request is intercepted; no real gateway, credential file or vendor is used.
++const assert = require("node:assert/strict");
++const fs = require("node:fs/promises");
++const path = require("node:path");
++const { test } = require("node:test");
++const { chromium, webkit } = require("playwright");
++const assets = process.env.MAGPIE_KEY_FORM_ASSETS || path.resolve(__dirname, "../assets");
++const legacy = "moonup.dev …cbed · 69456bde";
++const method = { type: "api", label: "moonup API key", keyForm: {
++  keysURL: "https://moonup.dev/keys",
++  protocols: [{ label: "Any protocol", value: "" }, { label: "Anthropic", value: "anthropic_messages" }, { label: "Responses", value: "openai_responses" }],
++} };
++
++function serve(lang, posts, accounts) {
++  let rejected = false;
++  const payload = () => ({
++    providers: [{ id: "moonup", name: "moonup", icon: "generic", models: [], agents: [], key: {},
++      account: { agent: "moonup", agentName: "moonup", user: accounts[0], logins: accounts.map((user, i) => ({ user, active: i === 0, on: true })) } }],
++    presets: [], excluded: [], gateway: { running: true, window: true },
++    plugins: [{ id: "moonup", pid: "moonup", name: "moonup", icon: "generic", spec: "magpie-moonup", methods: [method], signedIn: true }],
++  });
++  return async (route) => {
++    const url = new URL(route.request().url());
++    const json = (data) => route.fulfill({ json: data });
++    if (url.pathname === "/boot.js") return route.fulfill({ contentType: "text/javascript", body: `window.bootPrefs = {lang:${JSON.stringify(lang)},theme:"light",web:false};` });
++    if (url.pathname === "/wails/runtime.js") return route.fulfill({ contentType: "text/javascript", body: "export const Window = {};" });
++    if (url.pathname === "/api/state") return json({ agents: [], profiles: [], settings: { lang, theme: "light" } });
++    if (url.pathname === "/api/providers") return json(payload());
++    if (url.pathname === "/api/groups") return json({ groups: [], pools: [] });
++    if (url.pathname === "/api/plugin-signin/prompt") return json({ prompt: null, inputs: {} });
++    if (route.request().method() === "POST") {
++      const body = route.request().postDataJSON();
++      posts.push({ path: url.pathname, body });
++      if (url.pathname === "/api/plugin-signin") {
++        if (body.key === "sk-retry" && !rejected) {
++          rejected = true;
++          return route.fulfill({ status: 400, json: { error: "Temporary failure" } });
++        }
++        const user = body.inputs.name || body.key;
++        if (!accounts.includes(user)) accounts.push(user);
++        return json({ agent: "moonup", state: "done", user });
++      }
++      return json({});
++    }
++    if (url.pathname.startsWith("/api/")) return json({});
++    const file = path.join(assets, url.pathname === "/" ? "index.html" : url.pathname);
++    const contentType = { ".html": "text/html", ".js": "text/javascript", ".css": "text/css", ".svg": "image/svg+xml", ".png": "image/png" }[path.extname(file)];
++    try { await route.fulfill({ body: await fs.readFile(file), contentType }); }
++    catch { await route.fulfill({ status: 404, body: "" }); }
++  };
++}
++
++for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium", "webkit"])) {
++  test(engine + ": native plugin Key form", async (t) => {
++    const browser = await (engine === "webkit" ? webkit.launch() : chromium.launch({ channel: "chromium" }));
++    t.after(() => browser.close());
++    for (const lang of ["en", "zh", "zh-TW", "ja", "de"]) {
++      for (const width of [420, 1100]) await t.test(`${lang} ${width}`, async () => {
++        const page = await (await browser.newContext({ viewport: { width, height: 850 }, reducedMotion: "reduce" })).newPage();
++        page.setDefaultTimeout(6000);
++        t.after(() => page.close());
++        const posts = [], accounts = [legacy], errors = [];
++        page.on("pageerror", (e) => errors.push(e.message));
++        await page.route("**/*", serve(lang, posts, accounts));
++        await page.goto("http://magpie.test/?view=providers");
++        await page.locator(".row.provider", { hasText: "moonup" }).click();
++        const tr = (key) => page.evaluate((key) => t(key), key);
++        const another = await tr("Add another key");
++        await page.getByRole("button", { name: another, exact: true }).click();
++        const form = page.locator(".plugin-key-form");
++        await form.waitFor();
++        const add = form.getByRole("button", { name: await tr("Add"), exact: true });
++        assert.equal(await add.isDisabled(), true);
++        await form.getByRole("button", { name: await tr("Get a key ↗"), exact: true }).click();
++        await page.waitForFunction(() => true);
++        await form.getByLabel(await tr("Name (optional), e.g. Team"), { exact: true }).fill("Team");
++        const key = form.getByLabel("moonup API key", { exact: true });
++        assert.equal(await key.getAttribute("type"), "password");
++        await key.fill("sk-team");
++        if (process.env.ARTIFACT_DIR) {
++          await fs.mkdir(process.env.ARTIFACT_DIR, { recursive: true });
++          await form.screenshot({ path: path.join(process.env.ARTIFACT_DIR, `plugin-key-form-before-${engine}-${lang}-${width}.png`) });
++        }
++        await form.locator(".proto").click();
++        await page.locator(".proto-menu .pm-item", { hasText: "Anthropic" }).click();
++        const rect = await form.boundingBox();
++        for (const field of await form.locator("input, button").all()) {
++          const r = await field.boundingBox();
++          assert.ok(r.x >= rect.x - 1 && r.x + r.width <= rect.x + rect.width + 1, "form control spills outside the row");
++        }
++        if (process.env.ARTIFACT_DIR) {
++          await fs.mkdir(process.env.ARTIFACT_DIR, { recursive: true });
++          await form.screenshot({ path: path.join(process.env.ARTIFACT_DIR, `plugin-key-form-${engine}-${lang}-${width}.png`) });
++        }
++        await add.click();
++        await page.waitForFunction(() => !document.querySelector(".plugin-key-form"));
++        assert.deepEqual(accounts, [legacy, "Team"]);
++        assert.deepEqual(posts.find((p) => p.path === "/api/plugin-signin").body, {
++          provider: "moonup", method: 0, inputs: { name: "Team", protocol: "anthropic_messages" }, key: "sk-team",
++        });
++        assert.ok(posts.some((p) => p.path === "/api/open" && p.body.url === "https://moonup.dev/keys"));
++        await page.getByRole("button", { name: another, exact: true }).click();
++        // Pasting several switches automatically and deduplicates the batch.
++        await form.getByRole("button", { name: await tr("Paste several"), exact: true }).click();
++        await form.locator("textarea").waitFor();
++        await form.getByRole("button", { name: await tr("Add one key"), exact: true }).click();
++        await form.getByLabel("moonup API key").evaluate((field) => {
++          const data = new DataTransfer();
++          data.setData("text/plain", "sk-before, sk-before; sk-retry\nsk-after");
++          field.dispatchEvent(new ClipboardEvent("paste", { bubbles: true, cancelable: true, clipboardData: data }));
++        });
++        const bulk = form.locator("textarea");
++        await bulk.waitFor();
++        await add.click();
++        await form.locator(".why", { hasText: "Temporary failure" }).waitFor();
++        assert.equal(await bulk.inputValue(), "sk-retry\nsk-after");
++        assert.deepEqual(accounts, [legacy, "Team", "sk-before"]);
++        await add.click();
++        await page.waitForFunction(() => !document.querySelector(".plugin-key-form"));
++        assert.deepEqual(accounts, [legacy, "Team", "sk-before", "sk-retry", "sk-after"]);
++        assert.equal(posts.filter((p) => p.path === "/api/plugin-signin" && p.body.key === "sk-before").length, 1);
++        await page.getByRole("button", { name: another, exact: true }).click();
++        await form.getByRole("button", { name: await tr("Cancel"), exact: true }).click();
++        assert.deepEqual(errors, []);
++      });
++    }
++  });
++}
+diff --git a/docs/subsystems/provider-plugins.md b/docs/subsystems/provider-plugins.md
+--- a/docs/subsystems/provider-plugins.md
++++ b/docs/subsystems/provider-plugins.md
+@@ -169,3 +169,16 @@
+ ```
+ 
+ Some migration and gateway plugin tests require Bun on PATH and use local plugin fixtures; they skip when Bun is unavailable. Report any skipped tests and verify the community package separately when its implementation changes.
++
++## Native API Key forms
++
++An API auth method may opt into `keyForm: { keysURL, protocols: [{label, value}] }`.
++`methods` in `host.js` validates these display hints and `plugin.Method` carries them
++to the GUI. `renderPluginKeyForm` uses the native Key editor's fields, batch parser
++and menu. Each Key still goes separately through `plugin-signin`, and credentials
++remain in `plugin-auth.json`; no existing account or provider is converted.
++The optional name and protocol go in `inputs.name` and `inputs.protocol`. The plugin
++must validate and explicitly retain them in its authorization metadata, and enforce
++the protocol when listing models and sending requests. A failed batch retains only
++the unprocessed Keys for retry. Older hosts ignore `keyForm` and retain their API
++Key input; plugins must keep that path usable without extra prompts.

@@ -116,24 +116,22 @@ test("configured sites require only the API key", async () => {
   assert.equal(config.provider.moonup.name, "My site");
 });
 
-// New accounts select either moonup endpoint before entering their API Key.
-// Authorization preserves each selected destination, and provider discovery displays moonup's own identity.
-test("sign-in offers both moonup addresses and saves the selection", async () => {
+// New accounts go straight to the Key; an older host may still submit a cached site answer.
+// Both legacy destinations remain accepted without reintroducing an extra question.
+test("adding a key needs no prompts and accepts legacy site selections", async () => {
   const hooks = await MoonupPlugin();
   const method = hooks.auth.methods[0];
-  const prompt = method.prompts[0];
-  assert.equal(prompt.type, "select");
-  assert.deepEqual(prompt.options, [
-    { label: "moonup.dev", value: "https://moonup.dev" },
-    { label: "api.moonup.dev", value: "https://api.moonup.dev" },
-  ]);
-  for (const option of prompt.options) {
-    assert.deepEqual(await method.authorize({ baseURL: option.value }), {
+  assert.equal(hooks.auth.methods.length, 1);
+  assert.equal(method.type, "api");
+  assert.equal(method.placeholder, "sk-…");
+  assert.deepEqual(method.prompts, []);
+  for (const baseURL of ["https://moonup.dev", "https://api.moonup.dev"]) {
+    assert.deepEqual(await method.authorize({ baseURL }), {
       type: "success",
-      metadata: { baseURL: option.value },
+      metadata: { baseURL },
     });
   }
-  assert.deepEqual(await method.authorize({}), {
+  assert.deepEqual(await method.authorize(), {
     type: "success",
     metadata: { baseURL: "https://moonup.dev" },
   });
@@ -146,6 +144,144 @@ test("sign-in offers both moonup addresses and saves the selection", async () =>
   assert.equal(config.provider.moonup.name, "moonup");
   assert.equal(hooks.auth.provider, "moonup");
   assert.equal(method.label, "moonup API key");
+});
+
+test("native key forms offer the keys page and all supported protocols", async () => {
+  const method = (await MoonupPlugin()).auth.methods[0];
+  assert.equal(method.keyForm.keysURL, "https://moonup.dev/keys");
+  assert.deepEqual(method.keyForm.protocols.map(({ value }) => value), [
+    "", "anthropic_messages", "openai_responses",
+    "openai_chat_completions", "gemini_generate_content",
+  ]);
+  for (const [baseURL, keysURL] of [
+    ["https://api.moonup.dev", "https://moonup.dev/keys"],
+    ["https://custom.example/site/v1", "https://custom.example/site/keys"],
+  ]) {
+    const hooks = await MoonupPlugin({}, { baseURL });
+    assert.equal(hooks.auth.methods[0].keyForm.keysURL, keysURL);
+  }
+});
+
+test("named keys retain validated names and protocols without copying credentials", async () => {
+  const saved = [];
+  const hooks = await MoonupPlugin({
+    client: { auth: { set: async (value) => saved.push(value) } },
+  });
+  const method = hooks.auth.methods[0];
+  const result = await method.authorize({
+    name: "  Team  ", protocol: "anthropic_messages", key: "never-copy-this",
+  });
+  assert.deepEqual(result.metadata, {
+    baseURL: "https://moonup.dev", name: "Team", protocol: "anthropic_messages",
+  });
+  const auth = { type: "api", key: "sk-new-named", metadata: result.metadata };
+  await hooks.auth.loader(async () => auth);
+  assert.equal(saved[0].body.accountId, "Team");
+  assert.equal(saved[0].body.metadata.protocol, "anthropic_messages");
+  await hooks.auth.loader(async () => ({ ...saved[0].body, metadata: { ...result.metadata, name: "Renamed" } }));
+  assert.equal(saved.length, 1, "a display change must not replace the account identity");
+  for (const inputs of [{ name: "x".repeat(101) }, { name: {} }, { protocol: "unknown" }]) {
+    await assert.rejects(method.authorize(inputs));
+  }
+});
+
+test("key protocols filter explicit permissions and select legacy alias transports", async (t) => {
+  t.mock.method(globalThis, "fetch", async () => Response.json({ data: [
+    { id: "gpt-legacy-alias" },
+    { id: "allowed", protocols: ["anthropic_messages", "openai_responses"], native_protocols: ["openai_responses"] },
+    { id: "blocked", protocols: ["openai_chat_completions"] },
+    { id: "disabled", protocols: [] },
+  ] }));
+  const hooks = await MoonupPlugin();
+  const auth = { type: "api", key: "sk-protocol-key", metadata: {
+    baseURL: "https://moonup.dev", protocol: "anthropic_messages",
+  } };
+  const models = await hooks.provider.models({}, { auth });
+  assert.deepEqual(Object.keys(models), ["gpt-legacy-alias", "allowed"]);
+  assert.ok(Object.values(models).every((model) => model.api.npm === "@ai-sdk/anthropic"));
+  const automatic = await hooks.provider.models({}, { auth: { ...auth, metadata: { baseURL: "https://moonup.dev" } } });
+  assert.equal(automatic["gpt-legacy-alias"].api.npm, "@ai-sdk/openai");
+  assert.ok(Object.hasOwn(automatic, "blocked"));
+});
+
+test("generation enforces each key's protocol before contacting the gateway", async (t) => {
+  const fixture = await gateway(t);
+  const hooks = await MoonupPlugin();
+  for (const [protocol, operation] of [
+    ["anthropic_messages", "messages"],
+    ["openai_responses", "responses"],
+    ["openai_chat_completions", "chat/completions"],
+    ["gemini_generate_content", "models/gemini:generateContent"],
+  ]) {
+    const loader = await hooks.auth.loader(async () => ({
+      type: "api", key: "sk-protocol-key", metadata: { baseURL: fixture.base, protocol },
+    }));
+    const response = await loader.fetch(loader.baseURL + "/" + operation, { method: "POST", body: "{}" });
+    await response.text();
+    const calls = fixture.requests.length;
+    const blocked = operation === "responses" ? "messages" : "responses";
+    await assert.rejects(loader.fetch(loader.baseURL + "/" + blocked, { method: "POST", body: "{}" }), /密钥设置不一致/);
+    assert.equal(fixture.requests.length, calls);
+  }
+});
+
+// A plain API method can leave out metadata. All hooks use the same default,
+// and naming the account keeps the host's existing private uid and extra fields.
+test("keys without site metadata use moonup without replacing saved fields", async (t) => {
+  const requests = [];
+  t.mock.method(globalThis, "fetch", async (url, init) => {
+    requests.push({ url: String(url), authorization: init.headers.Authorization });
+    return Response.json(String(url).endsWith("/usage") ? { mode: "unrestricted", balance: 1 } : { data: [] });
+  });
+  const saved = [];
+  const hooks = await MoonupPlugin({
+    client: { auth: { set: async (value) => saved.push(value) } },
+  });
+  const auth = { type: "api", key: "sk-fixture", uid: "host-uid", metadata: { custom: "kept" } };
+  const original = structuredClone(auth);
+  const loader = await hooks.auth.loader(async () => auth);
+  assert.equal(loader.baseURL, "https://moonup.dev/v1");
+  assert.deepEqual(await hooks.provider.models({}, { auth }), Object.create(null));
+  assert.equal((await hooks.auth.usage(async () => auth)).error, undefined);
+  assert.deepEqual(requests.map((request) => request.url), [
+    "https://moonup.dev/v1/models?include=capabilities",
+    "https://moonup.dev/v1/usage",
+  ]);
+  assert.ok(requests.every((request) => request.authorization === "Bearer sk-fixture"));
+  assert.ok(saved.every(({ body }) => body.uid === auth.uid && body.metadata.custom === "kept"));
+  assert.deepEqual(auth, original);
+});
+
+// Older accounts can have either built-in site or a custom deployment path.
+// Updating defaults must preserve their destinations, identities and per-account settings.
+test("upgrades keep old account destinations and identities alongside new keys", async (t) => {
+  const requests = [];
+  t.mock.method(globalThis, "fetch", async (url, init) => {
+    requests.push({ url: String(url), authorization: init.headers.Authorization });
+    return Response.json(String(url).endsWith("/usage") ? { mode: "unrestricted", balance: 1 } : { data: [] });
+  });
+  const saved = [];
+  const hooks = await MoonupPlugin(
+    { client: { auth: { set: async (value) => saved.push(value) } } },
+    { baseURL: "https://new.example/site" },
+  );
+  const accounts = ["https://moonup.dev", "https://api.moonup.dev", "https://old.example/path"].map((baseURL, index) => ({
+    type: "api", key: `sk-legacy-${index}`, accountId: `legacy-account-${index}`,
+    uid: `legacy-uid-${index}`, metadata: { baseURL, custom: "preserved" },
+  }));
+  const original = structuredClone(accounts);
+  for (const auth of accounts) {
+    assert.equal((await hooks.auth.loader(async () => auth)).baseURL, auth.metadata.baseURL + "/v1");
+    await hooks.provider.models({}, { auth });
+    assert.equal((await hooks.auth.usage(async () => auth)).error, undefined);
+    assert.ok(requests.slice(-2).every((request) => request.url.startsWith(auth.metadata.baseURL + "/v1/") && request.authorization === `Bearer ${auth.key}`));
+  }
+  assert.deepEqual(accounts, original);
+  assert.deepEqual(saved, []);
+  const result = await hooks.auth.methods[0].authorize();
+  assert.equal(result.metadata.baseURL, "https://new.example/site");
+  const fresh = { type: "api", key: "sk-new-key", metadata: result.metadata };
+  assert.equal((await hooks.auth.loader(async () => fresh)).baseURL, "https://new.example/site/v1");
 });
 
 // Invalid override addresses can contain accidentally pasted credentials or hostile schemes.

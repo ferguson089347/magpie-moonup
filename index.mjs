@@ -27,29 +27,25 @@ const ENDPOINTS = [
   ["gemini_generate_content", "@ai-sdk/google", "/v1beta"],
 ];
 
-// SITE_OPTIONS provides moonup's two built-in HTTPS destinations for new
-// accounts; each selected address is persisted with its own API Key metadata.
-const SITE_OPTIONS = [
-  { label: "moonup.dev", value: "https://moonup.dev" },
-  { label: "api.moonup.dev", value: "https://api.moonup.dev" },
+// Keep accepting site answers submitted by older hosts after the prompt is removed.
+const SITES = ["https://moonup.dev", "https://api.moonup.dev"];
+const KEY_PROTOCOLS = [
+  { label: "Any protocol", value: "" },
+  { label: "Anthropic", value: "anthropic_messages" },
+  { label: "Responses", value: "openai_responses" },
+  { label: "Chat Completions", value: "openai_chat_completions" },
+  { label: "Gemini", value: "gemini_generate_content" },
 ];
 
 /** MoonupPlugin supplies per-Key models, generation, and usage to Magpie.
- * New accounts select a built-in moonup address before supplying their Key.
- * A configured baseURL skips that selection; saved account addresses take
- * precedence. Magpie owns credential persistence and
+ * New accounts supply only their Key, using moonup.dev unless baseURL is configured.
+ * Saved account addresses take precedence. Magpie owns credential persistence and
  * account failover, and no plugin-specific credential file is created.
  */
 export async function MoonupPlugin({ client } = {}, options = {}) {
   const configuredBase = options.baseURL ? normalizeBase(options.baseURL) : "";
   const modelProtocols = validateModelProtocols(options.modelProtocols);
   const queries = createQueries();
-  const sitePrompt = {
-    type: "select",
-    key: "baseURL",
-    message: "选择 moonup 地址 / Choose moonup address",
-    options: SITE_OPTIONS.map((site) => ({ ...site })),
-  };
   return {
     /** config declares the provider before any account has been added.
      * Existing user configuration takes precedence, including its display name
@@ -70,25 +66,40 @@ export async function MoonupPlugin({ client } = {}, options = {}) {
           type: "api",
           label: "moonup API key",
           placeholder: "sk-…",
-          prompts: configuredBase ? [] : [sitePrompt],
+          prompts: [],
+          // Magpie's companion key-form extension; older hosts keep their API Key input.
+          keyForm: {
+            keysURL: (SITES.includes(configuredBase) || !configuredBase
+              ? SITES[0] : configuredBase) + "/keys",
+            protocols: KEY_PROTOCOLS.map((protocol) => ({ ...protocol })),
+          },
           /** authorize resolves the address accompanying Magpie's separately collected Key.
-           * A configured address skips selection; otherwise the first built-in
-           * address is the default. Unlisted selections are rejected, and Magpie
+           * Legacy site answers remain accepted; new keys use the configured
+           * address or moonup.dev. Unlisted selections are rejected, and Magpie
            * saves the Key separately through its API method.
            */
           async authorize(inputs) {
             const baseURL = normalizeBase(
-              inputs?.baseURL || configuredBase || SITE_OPTIONS[0].value,
+              inputs?.baseURL || configuredBase || SITES[0],
             );
             if (
               !configuredBase &&
-              !SITE_OPTIONS.some((site) => site.value === baseURL)
+              !SITES.includes(baseURL)
             ) {
               throw new Error("请选择 moonup.dev 或 api.moonup.dev。");
             }
+            const name = inputs?.name;
+            if (name != null && (typeof name !== "string" || name.trim().length > 100)) {
+              throw new Error("密钥名称不能超过 100 个字符。");
+            }
+            const protocol = keyProtocol(inputs?.protocol);
             return {
               type: "success",
-              metadata: { baseURL },
+              metadata: {
+                baseURL,
+                ...(name?.trim() ? { name: name.trim() } : {}),
+                ...(protocol ? { protocol } : {}),
+              },
             };
           },
         },
@@ -153,7 +164,7 @@ export async function MoonupPlugin({ client } = {}, options = {}) {
         );
         const models = Object.create(null);
         for (const model of body.data) {
-          const entry = runtimeModel(model, account.base, modelProtocols);
+          const entry = runtimeModel(model, account.base, modelProtocols, account.protocol);
           if (entry) models[model.id] = entry;
         }
         return models;
@@ -207,8 +218,9 @@ function accountOf(auth, configuredBase) {
       signIn: "expired",
     });
   }
-  const base = normalizeBase(auth.metadata?.baseURL || configuredBase);
+  const base = normalizeBase(auth.metadata?.baseURL || configuredBase || SITES[0]);
   const key = auth.key.trim();
+  const protocol = keyProtocol(auth.metadata?.protocol);
   const identity = createHash("sha256")
     .update(base + "\0" + key)
     .digest("hex");
@@ -217,8 +229,17 @@ function accountOf(auth, configuredBase) {
   const suffix =
     key.length >= 8 ? ` · 密钥尾号 ${key.slice(-4)}` : " · API Key";
   const name =
-    auth.accountId || auth.metadata?.email || `${new URL(base).host}${suffix}`;
-  return { auth, base, key, name, identity };
+    auth.accountId || auth.metadata?.email || auth.metadata?.name || `${new URL(base).host}${suffix}`;
+  return { auth, base, key, name, identity, protocol };
+}
+
+/** keyProtocol validates a per-Key endpoint restriction; missing means legacy automatic routing. */
+function keyProtocol(value) {
+  if (value == null || value === "") return "";
+  if (!ENDPOINTS.some(([id]) => id === value)) {
+    throw new Error("请选择支持的 moonup 文本协议。");
+  }
+  return value;
 }
 
 /** nameAccount persists a stable label in Magpie's current account scope.
@@ -248,8 +269,11 @@ async function nameAccount(client, account) {
  * uses those restrictions even when another route offers larger limits. Exact
  * reasoning choices are exposed as variants without introducing additional models.
  */
-function runtimeModel(model, base, overrides) {
-  const protocols = protocolsOf(model, overrides);
+function runtimeModel(model, base, overrides, selectedProtocol) {
+  const protocols = selectedProtocol
+    ? (Object.hasOwn(model, "protocols") && !model.protocols.includes(selectedProtocol)
+      ? [] : [selectedProtocol])
+    : protocolsOf(model, overrides);
   const native = Array.isArray(model.native_protocols)
     ? model.native_protocols
     : [];
@@ -401,6 +425,13 @@ async function forward(account, input, init, queries) {
     ].includes(operation)
   ) {
     throw new Error("moonup 插件不支持此请求接口。");
+  }
+  const protocol = gemini ? "gemini_generate_content"
+    : operation === "responses" ? "openai_responses"
+    : operation === "chat/completions" ? "openai_chat_completions"
+    : "anthropic_messages";
+  if (account.protocol && account.protocol !== protocol) {
+    throw new Error("模型请求协议与当前 moonup 密钥设置不一致。");
   }
   if (gemini) {
     // Magpie's loader base overrides per-model URLs. Restore Gemini's version
